@@ -186,7 +186,11 @@ func validateOptions(cmd *cobra.Command) error {
 	// We want to use a special no-TTY style, when stdout is not a terminal
 	// and there was no specific style passed by arg
 	if !isTerminal && !cmd.Flags().Changed("style") {
-		style = "notty"
+		// Only default to notty if we are NOT in TUI mode
+		// If TUI mode is forced (-t), we want colors even if piped
+		if !tui && !cmd.Flags().Changed("tui") {
+			style = "notty"
+		}
 	}
 
 	// Detect terminal width

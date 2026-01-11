@@ -11,9 +11,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/glow/v2/utils"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
 	"github.com/muesli/gitcha"
 	te "github.com/muesli/termenv"
+	"golang.org/x/term"
 )
 
 const (
@@ -23,6 +25,10 @@ const (
 
 var (
 	config Config
+
+	// ttyOutput is set when stdout is not a terminal and we open /dev/tty instead.
+	// This is used for color profile detection in glamour rendering.
+	ttyOutput *os.File
 
 	markdownExtensions = []string{
 		"*.md", "*.mdown", "*.mkdn", "*.mkd", "*.markdown",
@@ -44,6 +50,40 @@ func NewProgram(cfg Config, content string) *tea.Program {
 	if cfg.EnableMouse {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
+
+	// Detect color profile from environment, fallback to TrueColor
+	// since most modern terminals support it
+	colorProfile := te.EnvColorProfile()
+	if colorProfile == te.Ascii {
+		colorProfile = te.TrueColor
+	}
+
+	// If stdin or stdout is not a terminal (e.g., piped in Helix :insert-output),
+	// open /dev/tty for input/output so the TUI works correctly.
+	stdinIsTTY := term.IsTerminal(int(os.Stdin.Fd()))
+	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
+
+	if !stdinIsTTY || !stdoutIsTTY {
+		var err error
+		ttyOutput, err = os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err != nil {
+			log.Error("failed to open /dev/tty", "error", err)
+		} else {
+			if !stdinIsTTY {
+				opts = append(opts, tea.WithInput(ttyOutput))
+			}
+			if !stdoutIsTTY {
+				opts = append(opts, tea.WithOutput(ttyOutput))
+			}
+			// Force TrueColor profile since we know we're in a modern terminal (Helix)
+			// and environment detection might be failing or stripped
+			lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(ttyOutput, te.WithProfile(te.TrueColor)))
+		}
+	} else {
+		// Both stdin/stdout are terminals, ensure color profile is set correctly
+		lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(os.Stdout, te.WithProfile(colorProfile)))
+	}
+
 	m := newModel(cfg, content)
 	return tea.NewProgram(m, opts...)
 }
@@ -134,7 +174,14 @@ func newModel(cfg Config, content string) tea.Model {
 	initSections()
 
 	if cfg.GlamourStyle == styles.AutoStyle {
-		if te.HasDarkBackground() {
+		// Try to detect background color, default to dark if detection fails
+		hasDarkBg := true
+		if ttyOutput != nil {
+			hasDarkBg = te.NewOutput(ttyOutput, te.WithProfile(te.EnvColorProfile())).HasDarkBackground()
+		} else if term.IsTerminal(int(os.Stdout.Fd())) {
+			hasDarkBg = te.HasDarkBackground()
+		}
+		if hasDarkBg {
 			cfg.GlamourStyle = styles.DarkStyle
 		} else {
 			cfg.GlamourStyle = styles.LightStyle

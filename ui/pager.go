@@ -432,7 +432,20 @@ func glamourRender(m pagerModel, markdown string) (string, error) {
 		width = 0
 	}
 
+	// Always use environment-based color detection with TrueColor fallback
+	// since terminal queries are unreliable when stdout is piped
+	colorProfile := termenv.EnvColorProfile()
+	if colorProfile == termenv.Ascii {
+		colorProfile = termenv.TrueColor
+	}
+
+	// Force TrueColor if we're outputting to TTY directly (piped stdout)
+	if ttyOutput != nil {
+		colorProfile = termenv.TrueColor
+	}
+
 	options := []glamour.TermRendererOption{
+		glamour.WithColorProfile(colorProfile),
 		utils.GlamourStyle(m.common.cfg.GlamourStyle, isCode),
 		glamour.WithWordWrap(width),
 	}
