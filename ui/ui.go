@@ -8,13 +8,11 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour/styles"
-	"github.com/charmbracelet/glow/v2/utils"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/glow/v3/utils"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/log"
 	"github.com/muesli/gitcha"
-	te "github.com/muesli/termenv"
 	"golang.org/x/term"
 )
 
@@ -23,65 +21,43 @@ const (
 	ellipsis             = "…"
 )
 
-var (
-	config Config
-
-	// ttyOutput is set when stdout is not a terminal and we open /dev/tty instead.
-	// This is used for color profile detection in glamour rendering.
-	ttyOutput *os.File
-
-	markdownExtensions = []string{
-		"*.md", "*.mdown", "*.mkdn", "*.mkd", "*.markdown",
-	}
-)
+var markdownExtensions = []string{
+	"*.md", "*.mdown", "*.mkdn", "*.mkd", "*.markdown",
+}
 
 // NewProgram returns a new Tea program.
 func NewProgram(cfg Config, content string) *tea.Program {
 	log.Debug(
 		"Starting glow",
-		"high_perf_pager",
-		cfg.HighPerformancePager,
 		"glamour",
 		cfg.GlamourEnabled,
 	)
 
-	config = cfg
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
-	if cfg.EnableMouse {
-		opts = append(opts, tea.WithMouseCellMotion())
-	}
+	var opts []tea.ProgramOption
 
-	// Detect color profile from environment, fallback to TrueColor
-	// since most modern terminals support it
-	colorProfile := te.EnvColorProfile()
-	if colorProfile == te.Ascii {
-		colorProfile = te.TrueColor
-	}
-
-	// If stdin or stdout is not a terminal (e.g., piped in Helix :insert-output),
-	// open /dev/tty for input/output so the TUI works correctly.
+	// If stdin or stdout is not a terminal (e.g. piped in Helix :insert-output),
+	// open the real TTY so the TUI can still run. Bubble Tea v2 already falls
+	// back to the TTY for input, but piped stdout still needs WithOutput, and
+	// editors often strip COLORTERM so we force TrueColor on that path.
 	stdinIsTTY := term.IsTerminal(int(os.Stdin.Fd()))
 	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
-
 	if !stdinIsTTY || !stdoutIsTTY {
-		var err error
-		ttyOutput, err = os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		ttyIn, ttyOut, err := tea.OpenTTY()
 		if err != nil {
-			log.Error("failed to open /dev/tty", "error", err)
+			log.Error("failed to open tty", "error", err)
 		} else {
 			if !stdinIsTTY {
-				opts = append(opts, tea.WithInput(ttyOutput))
+				opts = append(opts, tea.WithInput(ttyIn))
+			} else {
+				_ = ttyIn.Close()
 			}
 			if !stdoutIsTTY {
-				opts = append(opts, tea.WithOutput(ttyOutput))
+				opts = append(opts, tea.WithOutput(ttyOut))
+			} else {
+				_ = ttyOut.Close()
 			}
-			// Force TrueColor profile since we know we're in a modern terminal (Helix)
-			// and environment detection might be failing or stripped
-			lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(ttyOutput, te.WithProfile(te.TrueColor)))
+			opts = append(opts, tea.WithColorProfile(colorprofile.TrueColor))
 		}
-	} else {
-		// Both stdin/stdout are terminals, ensure color profile is set correctly
-		lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(os.Stdout, te.WithProfile(colorProfile)))
 	}
 
 	m := newModel(cfg, content)
@@ -135,6 +111,7 @@ type commonModel struct {
 	cwd    string
 	width  int
 	height int
+	styles Styles
 }
 
 type model struct {
@@ -160,10 +137,6 @@ func (m *model) unloadDocument() []tea.Cmd {
 	m.pager.showHelp = false
 
 	var batch []tea.Cmd
-	if m.pager.viewport.HighPerformanceRendering {
-		batch = append(batch, tea.ClearScrollArea) //nolint:staticcheck
-	}
-
 	if !m.stash.shouldSpin() {
 		batch = append(batch, m.stash.spinner.Tick)
 	}
@@ -171,25 +144,9 @@ func (m *model) unloadDocument() []tea.Cmd {
 }
 
 func newModel(cfg Config, content string) tea.Model {
-	initSections()
-
-	if cfg.GlamourStyle == styles.AutoStyle {
-		// Try to detect background color, default to dark if detection fails
-		hasDarkBg := true
-		if ttyOutput != nil {
-			hasDarkBg = te.NewOutput(ttyOutput, te.WithProfile(te.EnvColorProfile())).HasDarkBackground()
-		} else if term.IsTerminal(int(os.Stdout.Fd())) {
-			hasDarkBg = te.HasDarkBackground()
-		}
-		if hasDarkBg {
-			cfg.GlamourStyle = styles.DarkStyle
-		} else {
-			cfg.GlamourStyle = styles.LightStyle
-		}
-	}
-
 	common := commonModel{
-		cfg: cfg,
+		cfg:    cfg,
+		styles: newStyles(true),
 	}
 
 	m := model{
@@ -231,7 +188,7 @@ func newModel(cfg Config, content string) tea.Model {
 }
 
 func (m model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.stash.spinner.Tick}
+	cmds := []tea.Cmd{m.stash.spinner.Tick, tea.RequestBackgroundColor}
 
 	switch m.state {
 	case stateShowStash:
@@ -252,7 +209,7 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// If there's been an error, any key exits
 	if m.fatalErr != nil {
-		if _, ok := msg.(tea.KeyMsg); ok {
+		if _, ok := msg.(tea.KeyPressMsg); ok {
 			return m, tea.Quit
 		}
 	}
@@ -260,7 +217,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.BackgroundColorMsg:
+		m.common.styles = newStyles(msg.IsDark())
+		m.stash.stylePaginators(m.common.styles)
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc":
 			if m.state == stateShowDocument || m.stash.viewState == stashStateLoadingDocument {
@@ -371,20 +331,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) View() string {
-	if m.fatalErr != nil {
-		return errorView(m.fatalErr, true)
+func (m model) View() tea.View {
+	var content string
+	switch {
+	case m.fatalErr != nil:
+		content = errorView(m.common.styles, m.fatalErr, true)
+	case m.state == stateShowDocument:
+		content = m.pager.View()
+	default:
+		content = m.stash.view()
 	}
 
-	switch m.state { //nolint:exhaustive
-	case stateShowDocument:
-		return m.pager.View()
-	default:
-		return m.stash.view()
+	v := tea.NewView(content)
+	v.AltScreen = true
+	if m.common.cfg.EnableMouse {
+		v.MouseMode = tea.MouseModeCellMotion
 	}
+	return v
 }
 
-func errorView(err error, fatal bool) string {
+func errorView(styles Styles, err error, fatal bool) string {
 	exitMsg := "press any key to "
 	if fatal {
 		exitMsg += "exit"
@@ -392,9 +358,9 @@ func errorView(err error, fatal bool) string {
 		exitMsg += "return"
 	}
 	s := fmt.Sprintf("%s\n\n%v\n\n%s",
-		errorTitleStyle.Render("ERROR"),
+		styles.errorTitleStyle.Render("ERROR"),
 		err,
-		subtleStyle.Render(exitMsg),
+		styles.subtleStyle.Render(exitMsg),
 	)
 	return "\n" + indent(s, 3)
 }
