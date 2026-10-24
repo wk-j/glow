@@ -47,17 +47,7 @@ func NewProgram(cfg Config, content string) (*tea.Program, func()) {
 		if err != nil {
 			log.Error("failed to open tty", "error", err)
 		} else {
-			if !stdinIsTTY {
-				opts = append(opts, tea.WithInput(ttyIn))
-			} else {
-				_ = ttyIn.Close()
-			}
-			if !stdoutIsTTY {
-				opts = append(opts, tea.WithOutput(ttyOut))
-			} else {
-				_ = ttyOut.Close()
-			}
-			opts = append(opts, tea.WithColorProfile(colorprofile.TrueColor))
+			opts = ttyOptions(stdinIsTTY, stdoutIsTTY, ttyIn, ttyOut)
 		}
 	}
 
@@ -77,6 +67,25 @@ func NewProgram(cfg Config, content string) (*tea.Program, func()) {
 	}
 
 	return tea.NewProgram(m, opts...), func() {}
+}
+
+// ttyOptions routes the non-terminal side(s) of stdin/stdout to the TTY
+// handles returned by tea.OpenTTY and closes the handles left unused. On Unix
+// tea.OpenTTY returns one /dev/tty file for both sides; it stays open because
+// the other side still uses it.
+func ttyOptions(stdinIsTTY, stdoutIsTTY bool, ttyIn, ttyOut *os.File) []tea.ProgramOption {
+	var opts []tea.ProgramOption
+	if !stdinIsTTY {
+		opts = append(opts, tea.WithInput(ttyIn))
+	} else if ttyIn != ttyOut {
+		_ = ttyIn.Close()
+	}
+	if !stdoutIsTTY {
+		opts = append(opts, tea.WithOutput(ttyOut))
+	} else if ttyIn != ttyOut {
+		_ = ttyOut.Close()
+	}
+	return append(opts, tea.WithColorProfile(colorprofile.TrueColor))
 }
 
 type errMsg struct{ err error }
