@@ -25,8 +25,9 @@ var markdownExtensions = []string{
 	"*.md", "*.mdown", "*.mkdn", "*.mkd", "*.markdown",
 }
 
-// NewProgram returns a new Tea program.
-func NewProgram(cfg Config, content string) *tea.Program {
+// NewProgram returns a new Tea program. The returned cleanup function
+// restores the terminal state and must be called after the program exits.
+func NewProgram(cfg Config, content string) (*tea.Program, func()) {
 	log.Debug(
 		"Starting glow",
 		"glamour",
@@ -61,7 +62,21 @@ func NewProgram(cfg Config, content string) *tea.Program {
 	}
 
 	m := newModel(cfg, content)
-	return tea.NewProgram(m, opts...)
+
+	if utils.TextSizingEnabled() {
+		if tty, state, err := openRawTerminal(); err == nil {
+			painter := newRawPainter(os.Stdout, tty, state, cfg.EnableMouse)
+			prog := tea.NewProgram(
+				paintModel{inner: m, painter: painter},
+				tea.WithoutRenderer(),
+				tea.WithInput(tty),
+			)
+			painter.watchResize(prog)
+			return prog, painter.stop
+		}
+	}
+
+	return tea.NewProgram(m, opts...), func() {}
 }
 
 type errMsg struct{ err error }
@@ -182,6 +197,13 @@ func newModel(cfg Config, content string) tea.Model {
 			Note:      stripAbsolutePath(path, cwd),
 			Modtime:   info.ModTime(),
 		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			log.Error("unable to read file", "file", path, "error", err)
+			m.fatalErr = err
+			return m
+		}
+		m.pager.currentDocument.Body = string(utils.RemoveFrontmatter(content))
 	}
 
 	return m
@@ -194,13 +216,7 @@ func (m model) Init() tea.Cmd {
 	case stateShowStash:
 		cmds = append(cmds, findLocalFiles(*m.common))
 	case stateShowDocument:
-		content, err := os.ReadFile(m.common.cfg.Path)
-		if err != nil {
-			log.Error("unable to read file", "file", m.common.cfg.Path, "error", err)
-			return func() tea.Msg { return errMsg{err} }
-		}
-		body := string(utils.RemoveFrontmatter(content))
-		cmds = append(cmds, renderWithGlamour(m.pager, body))
+		cmds = append(cmds, renderWithGlamour(m.pager, m.pager.currentDocument.Body))
 	}
 
 	return tea.Batch(cmds...)
